@@ -1,9 +1,8 @@
 """
     If you want to run this yourself make sure to create a Cloudflare API token,
-    set it to have read radar permissions, then do:
+    and set it to have read radar permissions
 
-    pip install cloudflare pandas matplotlib
-    export CLOUDFLARE_API_TOKEN="..."
+    Also set UPDATE_FROM_API to True
 """
 
 import os
@@ -31,7 +30,8 @@ COUNTRIES = [
 
 OUT_DIR = Path("data")
 CACHE_DIR = OUT_DIR / "cache"  
-GRAPHS_DIR = OUT_DIR / "country-graphs"
+COUNTRY_GRAPHS_DIR = OUT_DIR / "country-graphs"
+ANALYSIS_DIR = OUT_DIR / "analysis"
 
 def label_columns(cols):
     mapping = {}
@@ -79,9 +79,44 @@ def fetch_country(client, cc):
     return df
 
 
+def quartile_table(data):
+    mean_bot = pd.Series(
+        {
+            cc: df["bot"].mean()
+            for cc, df in data.items()
+            if cc and "bot" in df.columns
+        },
+        name="mean_bot_usage",
+    ).dropna()
+
+    if mean_bot.empty:
+        raise ValueError("No country bot usage data is available")
+
+    quartile_labels = ["Low", "Medium-low", "Medium-high", "High"]
+    table = mean_bot.sort_values().rename_axis("country_code").reset_index()
+    table["category"] = pd.qcut(
+        table["mean_bot_usage"].rank(method="first"),
+        q=4,
+        labels=quartile_labels,
+    )
+
+    table = (
+        table.groupby("category", observed=False)
+        .agg(
+            country_codes=("country_code", lambda codes: ", ".join(sorted(codes))),
+            country_count=("country_code", "count"),
+            minimum_mean_bot_usage=("mean_bot_usage", "min"),
+            maximum_mean_bot_usage=("mean_bot_usage", "max"),
+        )
+        .reset_index()
+    )
+    return table
+
+
 def main():
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    GRAPHS_DIR.mkdir(parents=True, exist_ok=True)
+    COUNTRY_GRAPHS_DIR.mkdir(parents=True, exist_ok=True)
+    ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
     client = Cloudflare(api_token=os.environ.get("CLOUDFLARE_API_TOKEN"))
 
     data = {}
@@ -99,15 +134,58 @@ def main():
     if (UPDATE_FROM_API):
         time.sleep(0.5) 
 
-    # graph
+    # country graphs
     for cc in COUNTRIES:
         df = data[cc]
-        df.plot(kind="line", figsize=(8, 5), title=f"{cc} Human vs Bot HTTP Requests")
+        df.plot(
+            kind="line",
+            figsize=(8, 5),
+            title=f"{cc} Human vs Bot HTTP Requests",
+            color={"human": "orange", "bot": "blue"},
+        )
         plt.ylabel("Percent of Max Requests")
         if (cc == ""): 
             cc = 'global'
-        plt.savefig(GRAPHS_DIR / f"{cc}.png", dpi=150)
+        plt.savefig(COUNTRY_GRAPHS_DIR / f"{cc}.png", dpi=150)
         plt.close()
+
+    # combined
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for cc in COUNTRIES:
+        if not cc:
+            continue
+        df = data.get(cc)
+        if df is not None:
+            line = ax.plot(df.index, df["bot"], label=cc, linewidth=0.8)[0]
+            ax.annotate(
+                cc,
+                xy=(df.index[-1], df["bot"].iloc[-1]),
+                xytext=(-4, 0),
+                textcoords="offset points",
+                color=line.get_color(),
+                ha="right",
+                va="center",
+                fontsize="small",
+            )
+    ax.set_title("Bot HTTP Requests by Country")
+    ax.set_ylabel("Percent of Max Requests")
+    ax.set_xlabel("Time")
+    ax.set_xlim(
+        pd.Timestamp("2026-10-26", tz="UTC"),
+        pd.Timestamp("2026-11-02", tz="UTC")
+    )
+    fig.tight_layout()
+    fig.savefig(ANALYSIS_DIR / "all-countries-bot-usage.png", dpi=150)
+    plt.close(fig)
+
+    # table
+    bot_usage_table = quartile_table(data)
+    bot_usage_table.to_csv(
+        ANALYSIS_DIR / "country-codes-by-bot-usage.csv",
+        index=False,
+    )
+    print("\nCountry codes by bot usage:")
+    print(bot_usage_table.to_string(index=False))
 
 if __name__ == "__main__":
     main()
